@@ -951,3 +951,209 @@ struct SettingsManagerAUTests {
         )
     }
 }
+
+// MARK: - Host reuse across chain replacement
+//
+// A replacement chain keeps the live host of every unchanged entry so editing
+// one effect does not reset the others (tails, internal state, open editors).
+// Adapted from upstream PR #400 ("preserve AU hosts across chain updates").
+
+@Suite("AUEffectChain host reuse")
+struct AUEffectChainHostReuseTests {
+
+    /// Counts how many hosts a chain had to build (vs. reuse).
+    private final class FactoryCounter: @unchecked Sendable {
+        nonisolated(unsafe) var calls = 0
+        func factory() -> AUEffectChain.HostFactory {
+            { entry, rate, frames in
+                self.calls += 1
+                return AUEffectHost(descriptor: entry.pluginDescriptor, entryID: entry.id, sampleRate: rate, maxFrames: frames)
+            }
+        }
+    }
+
+    @Test("Unchanged entry keeps its live host")
+    func unchangedEntryReusesHost() throws {
+        let entry = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100)
+        let original = try #require(first.host(for: entry.id))
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 0)
+        #expect(second.host(for: entry.id) === original)
+        #expect(second.failedEntryIDs.isEmpty)
+    }
+
+    @Test("Adding an effect builds only the new host")
+    func addingKeepsExistingHosts() throws {
+        let a = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [a], sampleRate: 44100)
+        let originalA = try #require(first.host(for: a.id))
+        let b = AUEffectChainEntry(plugin: lowpass())
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [a, b], sampleRate: 44100, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 1)
+        #expect(second.host(for: a.id) === originalA)
+        #expect(second.host(for: b.id) != nil)
+    }
+
+    @Test("Reordering keeps hosts and follows the new order")
+    func reorderKeepsHosts() throws {
+        let a = AUEffectChainEntry(plugin: delay())
+        let b = AUEffectChainEntry(plugin: lowpass())
+        let first = AUEffectChain(entries: [a, b], sampleRate: 44100)
+        let hostA = try #require(first.host(for: a.id))
+        let hostB = try #require(first.host(for: b.id))
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [b, a], sampleRate: 44100, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 0)
+        #expect(second.hosts.count == 2)
+        #expect(second.hosts[0] === hostB)
+        #expect(second.hosts[1] === hostA)
+    }
+
+    @Test("A changed factory preset rebuilds the host")
+    func changedFactoryPresetRebuilds() throws {
+        var entry = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100)
+        let original = try #require(first.host(for: entry.id))
+        entry.selectedFactoryPresetIndex = 0
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 1)
+        #expect(second.host(for: entry.id) !== original)
+    }
+
+    @Test("A changed preset blob rebuilds the host")
+    func changedPresetDataRebuilds() throws {
+        var entry = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100)
+        let original = try #require(first.host(for: entry.id))
+        entry.presetData = try #require(original.savePreset())
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 1)
+        #expect(second.host(for: entry.id) !== original)
+    }
+
+    @Test("A different sample rate rebuilds the host")
+    func sampleRateChangeRebuilds() throws {
+        let entry = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100)
+        let original = try #require(first.host(for: entry.id))
+        let counter = FactoryCounter()
+
+        let second = AUEffectChain(entries: [entry], sampleRate: 48000, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 1)
+        #expect(second.host(for: entry.id) !== original)
+    }
+
+    @Test("A different frame capacity rebuilds the host")
+    func maxFramesChangeRebuilds() {
+        let entry = AUEffectChainEntry(plugin: delay())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 4096)
+        let counter = FactoryCounter()
+
+        _ = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 512, hostFactory: counter.factory(), reusing: first)
+
+        #expect(counter.calls == 1)
+    }
+
+    @Test("Disabling then re-enabling builds a fresh host")
+    func disableThenEnableRebuilds() throws {
+        var entry = AUEffectChainEntry(plugin: delay())
+        let enabled = AUEffectChain(entries: [entry], sampleRate: 44100)
+        let original = try #require(enabled.host(for: entry.id))
+
+        entry.isEnabled = false
+        let disabled = AUEffectChain(entries: [entry], sampleRate: 44100, reusing: enabled)
+        #expect(disabled.host(for: entry.id) == nil)
+
+        entry.isEnabled = true
+        let counter = FactoryCounter()
+        let reenabled = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: counter.factory(), reusing: disabled)
+        #expect(counter.calls == 1)
+        #expect(reenabled.host(for: entry.id) !== original)
+    }
+
+    @Test("A host that failed at render time is rebuilt, not reused")
+    func failedHostIsRebuilt() throws {
+        let entry = AUEffectChainEntry(plugin: delay())
+        let failing = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: { entry, rate, frames in
+            AUEffectHost(descriptor: entry.pluginDescriptor, entryID: entry.id, sampleRate: rate, maxFrames: frames,
+                         renderBackend: { _, _, _, _, _, _ in -1 })
+        })
+        var samples: [Float] = [0.1, -0.1, 0.2, -0.2]
+        samples.withUnsafeMutableBufferPointer { failing.processInterleaved(samples: $0.baseAddress!, frameCount: 2) }
+        let failedHost = try #require(failing.host(for: entry.id))
+        #expect(failedHost.renderFailed)
+        let counter = FactoryCounter()
+
+        let retried = AUEffectChain(entries: [entry], sampleRate: 44100, hostFactory: counter.factory(), reusing: failing)
+
+        #expect(counter.calls == 1)
+        #expect(retried.host(for: entry.id) !== failedHost)
+    }
+
+    @Test("A removed entry's host is released with the old chain")
+    func removedHostIsReleased() throws {
+        let a = AUEffectChainEntry(plugin: delay())
+        let b = AUEffectChainEntry(plugin: lowpass())
+        weak var weakA: AUEffectHost?
+        weak var weakB: AUEffectHost?
+        var second: AUEffectChain?
+        do {
+            let first = AUEffectChain(entries: [a, b], sampleRate: 44100)
+            weakA = first.host(for: a.id)
+            weakB = first.host(for: b.id)
+            second = AUEffectChain(entries: [a], sampleRate: 44100, reusing: first)
+        }
+        #expect(weakB == nil)
+        #expect(weakA != nil)
+        #expect(second?.host(for: a.id) === weakA)
+    }
+
+    @Test("A reused host keeps processing audio in the new chain")
+    func reusedHostStillRenders() throws {
+        let entry = AUEffectChainEntry(plugin: lowpass())
+        let first = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 256)
+        let au = try #require(first.hosts.first?.audioUnit)
+        AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 100.0, 0) // cutoff 100 Hz
+        let second = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 256, reusing: first)
+
+        let frames = 256
+        var buffer = [Float](repeating: 0, count: frames * 2)
+        for i in 0..<frames {
+            let s = sinf(2.0 * .pi * 15000.0 * Float(i) / 44100.0)
+            buffer[i * 2] = s
+            buffer[i * 2 + 1] = s
+        }
+        let inputEnergy = buffer.reduce(0) { $0 + $1 * $1 }
+        buffer.withUnsafeMutableBufferPointer { second.processInterleaved(samples: $0.baseAddress!, frameCount: frames) }
+        let outputEnergy = buffer.reduce(0) { $0 + $1 * $1 }
+
+        // The 100 Hz cutoff set on the original instance must still apply.
+        #expect(outputEnergy < inputEnergy * 0.1)
+    }
+
+    private func delay() -> AUPluginDescriptor {
+        AUPluginDescriptor(componentType: kAudioUnitType_Effect, componentSubType: 0x64656C79,
+                           componentManufacturer: 0x6170706C, name: "AUDelay", manufacturer: "Apple", version: 1)
+    }
+
+    private func lowpass() -> AUPluginDescriptor {
+        AUPluginDescriptor(componentType: kAudioUnitType_Effect, componentSubType: 0x6C706173,
+                           componentManufacturer: 0x6170706C, name: "AULowPassFilter", manufacturer: "Apple", version: 1)
+    }
+}

@@ -381,7 +381,7 @@ final class ProcessTapController: ProcessTapControlling {
         stagedDeviceAUBypassed = bypassed
         guard secondaryResources.isActive else { return }
         let rate = (try? secondaryResources.aggregateDeviceID.readNominalSampleRate()) ?? 48_000
-        let replacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: rate)
+        let replacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: rate, reusing: secondaryDeviceAUEffectChain)
         replacement?.setBypassed(bypassed)
         let previous = secondaryDeviceAUEffectChain
         secondaryDeviceAUEffectChain = replacement
@@ -393,7 +393,14 @@ final class ProcessTapController: ProcessTapControlling {
 
     private func replaceAUChain(_ entries: [AUEffectChainEntry], deviceChain: Bool) {
         let rate = (try? primaryResources.aggregateDeviceID.readNominalSampleRate()) ?? 48_000
-        let replacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: rate)
+        // Each slot only reuses hosts from its own previous chain: primary and
+        // secondary render concurrently during a crossfade, so a host must never
+        // be shared between them.
+        let replacement = entries.isEmpty ? nil : AUEffectChain(
+            entries: entries,
+            sampleRate: rate,
+            reusing: deviceChain ? deviceAUEffectChain : auEffectChain
+        )
         if deviceChain {
             let bypassed = deviceAUEffectChain?.isBypassed ?? false
             replacement?.setBypassed(bypassed)
@@ -401,7 +408,7 @@ final class ProcessTapController: ProcessTapControlling {
             deviceAUEffectChain = replacement
             if secondaryResources.isActive {
                 let secondaryRate = (try? secondaryResources.aggregateDeviceID.readNominalSampleRate()) ?? rate
-                let secondaryReplacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: secondaryRate)
+                let secondaryReplacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: secondaryRate, reusing: secondaryDeviceAUEffectChain)
                 secondaryReplacement?.setBypassed(secondaryDeviceAUEffectChain?.isBypassed ?? bypassed)
                 let oldSecondary = secondaryDeviceAUEffectChain
                 secondaryDeviceAUEffectChain = secondaryReplacement
@@ -415,7 +422,7 @@ final class ProcessTapController: ProcessTapControlling {
             auEffectChain = replacement
             if secondaryResources.isActive {
                 let secondaryRate = (try? secondaryResources.aggregateDeviceID.readNominalSampleRate()) ?? rate
-                let secondaryReplacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: secondaryRate)
+                let secondaryReplacement = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: secondaryRate, reusing: secondaryAUEffectChain)
                 secondaryReplacement?.setBypassed(secondaryAUEffectChain?.isBypassed ?? bypassed)
                 let oldSecondary = secondaryAUEffectChain
                 secondaryAUEffectChain = secondaryReplacement

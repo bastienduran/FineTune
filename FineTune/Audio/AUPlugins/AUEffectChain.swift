@@ -55,10 +55,31 @@ final class AUEffectChain: @unchecked Sendable {
 
     typealias HostFactory = (AUEffectChainEntry, Double, UInt32) -> AUEffectHost
 
-    init(entries: [AUEffectChainEntry], sampleRate: Double, maxFrames: UInt32 = 4096, hostFactory: HostFactory? = nil) {
+    /// Format the hosts were initialized for; a host is only reused by a
+    /// replacement chain built for the same format.
+    let sampleRate: Double
+    let maxFrames: UInt32
+
+    /// - Parameter previousChain: the chain this one replaces in the same slot
+    ///   (primary or secondary — never across slots, since both render
+    ///   concurrently during a device crossfade). Hosts whose entry is unchanged
+    ///   are carried over instead of being torn down and re-instantiated, so
+    ///   editing one effect does not reset the others (reverb/delay tails,
+    ///   internal state, open editor windows). Adapted from upstream PR #400
+    ///   (Joshan Kana, "preserve AU hosts across chain updates").
+    init(
+        entries: [AUEffectChainEntry],
+        sampleRate: Double,
+        maxFrames: UInt32 = 4096,
+        hostFactory: HostFactory? = nil,
+        reusing previousChain: AUEffectChain? = nil
+    ) {
         self.entries = entries
+        self.sampleRate = sampleRate
+        self.maxFrames = maxFrames
         var hosts: [AUEffectHost] = []
         var failed = Set<UUID>()
+        var reusedEntryIDs = Set<UUID>()
         let makeHost = hostFactory ?? { entry, rate, frames in AUEffectHost(
                 descriptor: entry.pluginDescriptor,
                 entryID: entry.id,
@@ -68,6 +89,12 @@ final class AUEffectChain: @unchecked Sendable {
             ) }
         for entry in entries {
             guard entry.isEnabled else { failed.insert(entry.id); continue }
+            if !reusedEntryIDs.contains(entry.id),
+               let reused = previousChain?.reusableHost(for: entry, sampleRate: sampleRate, maxFrames: maxFrames) {
+                reusedEntryIDs.insert(entry.id)
+                hosts.append(reused)
+                continue
+            }
             let host = makeHost(entry, sampleRate, maxFrames)
             if host.instantiate() {
                 if let presetData = entry.presetData {
@@ -85,7 +112,23 @@ final class AUEffectChain: @unchecked Sendable {
         self._hosts = hosts
         self._hostCount = hosts.count
 
-        logger.info("Created AU effect chain with \(hosts.count)/\(entries.count) plugins at \(sampleRate)Hz")
+        logger.info("Created AU effect chain with \(hosts.count)/\(entries.count) plugins at \(sampleRate)Hz (\(reusedEntryIDs.count) reused)")
+    }
+
+    /// The live host for `entry` if it can keep running unchanged in a
+    /// replacement chain: same entry, same plugin, same preset, same format,
+    /// and not failed. A changed preset is deliberately rebuilt so the new
+    /// configuration is applied before the instance reaches the audio thread.
+    private func reusableHost(for entry: AUEffectChainEntry, sampleRate: Double, maxFrames: UInt32) -> AUEffectHost? {
+        guard self.sampleRate == sampleRate, self.maxFrames == maxFrames,
+              let previous = entries.first(where: { $0.id == entry.id }),
+              previous.isEnabled,
+              previous.pluginDescriptor == entry.pluginDescriptor,
+              previous.presetData == entry.presetData,
+              previous.selectedFactoryPresetIndex == entry.selectedFactoryPresetIndex,
+              let host = host(for: entry.id),
+              !host.renderFailed else { return nil }
+        return host
     }
 
     // MARK: - Bypass
